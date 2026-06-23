@@ -1,0 +1,194 @@
+[
+  {
+    "id": 1,
+    "name": "embedded-library-not-yggstack",
+    "description": "Uses ratatoskr as an embedded Go library instead of yggstack or an external daemon.",
+    "prompt": "Write a small Go application that connects to Yggdrasil and makes an HTTP request to a service at [200:abcd::1]:8080. I want it embedded in the app, not a separate process.",
+    "trap": "The agent may recommend yggstack, a TUN device, root privileges, or shelling out to a Yggdrasil binary.",
+    "assertions": [
+      { "id": "1.1", "text": "Uses github.com/voluminor/ratatoskr and ratatoskr.New." },
+      { "id": "1.2", "text": "Sets http.Transport.DialContext = node.DialContext for the HTTP client." },
+      { "id": "1.3", "text": "Requires no TUN interface, root access, yggdrasil daemon, or yggstack binary." }
+    ]
+  },
+  {
+    "id": 2,
+    "name": "lifecycle-context-and-close",
+    "description": "Node lifecycle uses both context cancellation and explicit Close.",
+    "prompt": "Create a long-running Go service that starts a ratatoskr node and exits cleanly on SIGINT or SIGTERM.",
+    "trap": "The agent may start the node without a parent context, or rely on Ctx without calling Close (or vice versa).",
+    "assertions": [
+      { "id": "2.1", "text": "Creates ctx via signal.NotifyContext for the service and passes it as ratatoskr.ConfigObj.Ctx." },
+      { "id": "2.2", "text": "Calls defer node.Close() after a successful ratatoskr.New." },
+      { "id": "2.3", "text": "Treats Ctx and Close as both required (cancellation triggers shutdown; Close still releases resources), not either/or." }
+    ]
+  },
+  {
+    "id": 3,
+    "name": "peer-manager-conflict",
+    "description": "Enables the peer manager without also setting static Config.Peers.",
+    "prompt": "Start a ratatoskr node with a list of candidate peers and automatically keep the best peer per protocol connected.",
+    "trap": "The agent may put peers in Config.Peers and also configure peermgr.ConfigObj, causing ErrPeersConflict.",
+    "assertions": [
+      { "id": "3.1", "text": "Configures peers via ratatoskr.ConfigObj.Peers (peermgr.ConfigObj), not cfg.Config.Peers." },
+      { "id": "3.2", "text": "Leaves cfg.Config.Peers empty when the peer manager is enabled." },
+      { "id": "3.3", "text": "Notes that setting both yields ErrPeersConflict from ratatoskr.New." }
+    ]
+  },
+  {
+    "id": 4,
+    "name": "yggdrasil-http-listener",
+    "description": "HTTP services listen through node.Listen on the node's Yggdrasil address.",
+    "prompt": "Expose an HTTP endpoint on port 8080 inside the Yggdrasil network using ratatoskr.",
+    "trap": "The agent may use net.Listen on a local TCP port, or format the IPv6 listen address without brackets.",
+    "assertions": [
+      { "id": "4.1", "text": "Listens via node.Listen(\"tcp\", fmt.Sprintf(\"[%s]:%d\", node.Address(), 8080))." },
+      { "id": "4.2", "text": "Serves an http.Server on the Yggdrasil listener, not net.Listen on an OS port." },
+      { "id": "4.3", "text": "Sets a server timeout such as ReadHeaderTimeout." }
+    ]
+  },
+  {
+    "id": 5,
+    "name": "socks-root-api",
+    "description": "SOCKS5 setup uses the root EnableSOCKS and the correct resolver behavior.",
+    "prompt": "Add a local SOCKS5 proxy on 127.0.0.1:1080 to my embedded ratatoskr service. It should support .pk.ygg names.",
+    "trap": "The agent may instantiate low-level socks.New, or assume DNS is required for .pk.ygg.",
+    "assertions": [
+      { "id": "5.1", "text": "Enables SOCKS via node.EnableSOCKS(ratatoskr.SOCKSConfigObj{...}), not socks.New directly." },
+      { "id": "5.2", "text": "Sets Addr to 127.0.0.1:1080." },
+      { "id": "5.3", "text": "Leaves Nameserver empty and states .pk.ygg and IP literals resolve without DNS." }
+    ]
+  },
+  {
+    "id": 6,
+    "name": "nodeinfo-root-askaddr",
+    "description": "Basic NodeInfo queries use node.AskAddr with a deadline, not direct ninfo.New.",
+    "prompt": "Given a .pk.ygg name or a Yggdrasil IPv6 address, query the remote node's NodeInfo from my ratatoskr app.",
+    "trap": "The agent may type-assert to core.Obj and build ninfo.New even though the root object exposes AskAddr.",
+    "assertions": [
+      { "id": "6.1", "text": "Queries with node.AskAddr(ctx, target) (or node.Ask)." },
+      { "id": "6.2", "text": "Bounds the call with a context.WithTimeout deadline (generous, ~10-15s)." },
+      { "id": "6.3", "text": "Does not construct ninfo.New for the basic query." }
+    ]
+  },
+  {
+    "id": 7,
+    "name": "forwarding-start-wait",
+    "description": "Port forwarding configures mappings before Start and waits on shutdown.",
+    "prompt": "Forward local 127.0.0.1:8080 to a web service at [200:abcd::1]:80 over Yggdrasil.",
+    "trap": "The agent may omit context cancellation or mgr.Wait, or build the mapped address as a string instead of net.TCPAddr.",
+    "assertions": [
+      { "id": "7.1", "text": "Creates forward.New(logger, positiveTimeout) and adds a forward.TCPMappingObj via AddLocalTCP before Start." },
+      { "id": "7.2", "text": "Uses net.TCPAddr for Listen/Mapped (not a host-port string), then calls mgr.Start(ctx, node)." },
+      { "id": "7.3", "text": "On shutdown cancels the context and calls mgr.Wait()." }
+    ]
+  },
+  {
+    "id": 8,
+    "name": "publish-system-sigils",
+    "description": "Node metadata is published through built-in (system) sigils via ConfigObj.Sigils, kept small.",
+    "prompt": "Publish my node name, service type, and an HTTP service port in ratatoskr NodeInfo.",
+    "trap": "The agent may write an unbounded Config.NodeInfo map, or invent a custom sigil for data the built-ins already cover.",
+    "assertions": [
+      { "id": "8.1", "text": "Uses built-in system sigils (info.New and services.New) for name/type and service ports." },
+      { "id": "8.2", "text": "Publishes them as []sigils.Interface via ratatoskr.ConfigObj.Sigils." },
+      { "id": "8.3", "text": "Keeps sigil data small, citing the shared 16 KB NodeInfo budget." }
+    ]
+  },
+  {
+    "id": 9,
+    "name": "probe-advanced-core",
+    "description": "Topology probe is treated as an advanced, unstable integration requiring UnsafeCore.",
+    "prompt": "Add a diagnostic endpoint that traces the route to a Yggdrasil public key and returns topology information.",
+    "trap": "The agent may invent root-level probe methods, use an admin socket, or present probe as a stable default.",
+    "assertions": [
+      { "id": "9.1", "text": "Uses mod/probe and gets *core.Obj via node.Interface, calling UnsafeCore() for probe.New." },
+      { "id": "9.2", "text": "Bounds Trace/Tree with a context deadline and calls tr.Close()." },
+      { "id": "9.3", "text": "Warns that mod/probe and UnsafeCore are advanced/unstable, may change, and says to verify with go doc." }
+    ]
+  },
+  {
+    "id": 10,
+    "name": "do-not-hardcode-stale-go-version",
+    "description": "Version guidance is derived from the active module, not stale README text.",
+    "prompt": "What Go version should my project use for ratatoskr, and how should the agent verify it?",
+    "trap": "The agent may repeat an old README minimum without checking go.mod.",
+    "assertions": [
+      { "id": "10.1", "text": "Says to check the active ratatoskr go.mod or go list -m data." },
+      { "id": "10.2", "text": "Does not treat README text as the source of truth." },
+      { "id": "10.3", "text": "Notes that the module version selected in the user's project is what matters." }
+    ]
+  },
+  {
+    "id": 11,
+    "name": "settings-wip-warning",
+    "description": "Does not build configuration tooling on the work-in-progress mod/settings package.",
+    "prompt": "I want to build config file loading and saving for my ratatoskr app using mod/settings. Set that up.",
+    "trap": "The agent may treat mod/settings as stable and generate ParseFile/SaveFile tooling without warning that its schema is not finalized.",
+    "assertions": [
+      { "id": "11.1", "text": "States mod/settings is work in progress with a non-finalized schema." },
+      { "id": "11.2", "text": "Recommends yggdrasil-go/src/config directly for stable configuration." },
+      { "id": "11.3", "text": "Does not present mod/settings ParseFile/SaveFile as a stable API to build on." }
+    ]
+  },
+  {
+    "id": 12,
+    "name": "custom-sigil-typed",
+    "description": "Custom NodeInfo data is modeled as a sigil with typed access, read back from Extra, not via dynamic registration.",
+    "prompt": "I want to attach a custom field to my node's NodeInfo (an org name and a list of tags) and read it back from remote nodes in my own Go types, not as map[string]any.",
+    "trap": "The agent may write Config.NodeInfo as map[string]any, or try to make the custom sigil auto-parse by registering it (ninfo.AddSigil / ninfo.Parse(raw, sigil)) instead of reading res.Node.Extra.",
+    "assertions": [
+      { "id": "12.1", "text": "Defines a type implementing sigils.Interface with a typed ConfigObj and a validating New constructor." },
+      { "id": "12.2", "text": "Publishes it via ratatoskr.ConfigObj.Sigils, not by writing Config.NodeInfo maps." },
+      { "id": "12.3", "text": "Reads it back from res.Node.Extra with the sigil's package-level Parse, and does NOT register it via ninfo.AddSigil/ninfo.Parse(sg) for dynamic parsing." }
+    ]
+  },
+  {
+    "id": 13,
+    "name": "framework-net-listener-vs-fd",
+    "description": "Serves net.Listener frameworks directly, but bridges fd/epoll frameworks like gnet through forwarding.",
+    "prompt": "I want to serve my fasthttp app inside Yggdrasil, and separately I have a gnet-based server I also want reachable over Yggdrasil. How do I wire both?",
+    "trap": "The agent may claim gnet can accept node.Listen directly, or use net.Listen on an OS port for fasthttp instead of the Yggdrasil listener.",
+    "assertions": [
+      { "id": "13.1", "text": "Serves fasthttp directly via fasthttp.Serve on node.Listen(\"tcp\", [addr]:port)." },
+      { "id": "13.2", "text": "Explains gnet/evio use OS file descriptors and cannot consume the userspace gVisor listener directly." },
+      { "id": "13.3", "text": "Bridges gnet via mod/forward (AddRemoteTCP on the Yggdrasil side, dialing the local gnet socket)." }
+    ]
+  },
+  {
+    "id": 14,
+    "name": "core-only-submodule",
+    "description": "Assembles from mod/core when only raw networking is needed.",
+    "prompt": "I only need to dial and listen over Yggdrasil with the smallest possible dependency surface — no SOCKS, no peer manager, no NodeInfo. What is the leanest way?",
+    "trap": "The agent may insist on ratatoskr.New with all components, or reach into UnsafeCore unnecessarily.",
+    "assertions": [
+      { "id": "14.1", "text": "Uses core.New(core.ConfigObj{...}) from mod/core instead of the full ratatoskr.New facade." },
+      { "id": "14.2", "text": "Uses the returned core.Interface (DialContext/Listen) and defers Close()." },
+      { "id": "14.3", "text": "Does not reach for UnsafeCore() for ordinary dial/listen." }
+    ]
+  },
+  {
+    "id": 15,
+    "name": "constrained-mesh-transfer",
+    "description": "Large transfers over Yggdrasil are bounded, chunked, verified, and resumable, not one unbounded request.",
+    "prompt": "My ratatoskr app needs to download a large file (hundreds of MB) from a service at [200:abcd::1]:8080 over Yggdrasil. Write the client.",
+    "trap": "The agent streams the whole body in one http.Get / io.Copy with no chunking, no per-request deadline, unbounded connections, and no resume.",
+    "assertions": [
+      { "id": "15.1", "text": "Fetches in bounded Range chunks (not one streamed body), each independently retried so a dropped link costs one chunk." },
+      { "id": "15.2", "text": "Bounds the http.Transport (MaxConnsPerHost / MaxIdleConnsPerHost) and puts a per-attempt context deadline on each request." },
+      { "id": "15.3", "text": "Verifies each chunk (size/checksum) and makes the transfer resumable (skip already-fetched offsets); retries use backoff." }
+    ]
+  },
+  {
+    "id": 16,
+    "name": "multicast-enable-no-arg",
+    "description": "LAN peer discovery uses node.EnableMulticast() with no arguments; interfaces come from config.",
+    "prompt": "Let my ratatoskr node discover other Yggdrasil nodes on the same LAN automatically.",
+    "trap": "The agent calls node.EnableMulticast(logger) (the removed gologme parameter) or invents an interfaces argument.",
+    "assertions": [
+      { "id": "16.1", "text": "Calls node.EnableMulticast() with no arguments, and node.DisableMulticast() to stop." },
+      { "id": "16.2", "text": "States multicast interfaces come from cfg.Config.MulticastInterfaces (GenerateConfig sets a default), not a function argument." },
+      { "id": "16.3", "text": "Does not pass a logger or any argument to EnableMulticast." }
+    ]
+  }
+]
