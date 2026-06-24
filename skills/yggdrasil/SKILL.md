@@ -1,11 +1,10 @@
 ---
 name: yggdrasil
 description: "Use when building, reviewing, or debugging Go programs that join the Yggdrasil end-to-end-encrypted IPv6 mesh network via github.com/voluminor/ratatoskr: clients, HTTP/TCP/UDP servers, SOCKS5 proxies, port forwarding, peer management, and discoverable nodes."
-user-invocable: true
 license: LGPL-2.1
 metadata:
   author: SUNsung
-  version: "0.1.1"
+  version: "0.2.0"
   openclaw:
     emoji: "🌳"
     homepage: https://github.com/voluminor/skill-yggdrasil
