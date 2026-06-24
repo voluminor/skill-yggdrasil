@@ -1,11 +1,11 @@
 ---
-name: skill-yggdrasil
-description: "Use when building, reviewing, or debugging Go programs that join the Yggdrasil end-to-end-encrypted mesh network — clients, HTTP/TCP/UDP servers, SOCKS5 proxies, port forwarders, peer management, and discoverable nodes — with the node running in userspace and no TUN device, root, or external daemon. Covers dialing and listening over Yggdrasil IPv6, integrating frameworks (net/http, fasthttp, gRPC, gnet), publishing typed NodeInfo via sigils, and designing for a low-bandwidth, fault-prone mesh."
+name: yggdrasil
+description: "Use when building, reviewing, or debugging Go programs that join the Yggdrasil end-to-end-encrypted IPv6 mesh network via github.com/voluminor/ratatoskr: clients, HTTP/TCP/UDP servers, SOCKS5 proxies, port forwarding, peer management, and discoverable nodes."
 user-invocable: true
 license: LGPL-2.1
 metadata:
   author: SUNsung
-  version: "0.1.0"
+  version: "0.1.1"
   openclaw:
     emoji: "🌳"
     homepage: https://github.com/voluminor/skill-yggdrasil
