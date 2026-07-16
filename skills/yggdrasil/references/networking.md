@@ -1,77 +1,70 @@
-# Networking Patterns
+# Networking and framework integration
 
-## Contents
+Ratatoskr exposes userspace implementations of `net.Conn`, `net.Listener`, and
+`net.PacketConn`. They behave through standard Go interfaces but are not OS
+file descriptors.
 
-- Address formatting rules
-- Outbound HTTP
-- HTTP server inside Yggdrasil
-- TCP client and server
-- UDP client and server
-- LAN discovery and admin socket
-- Contexts, deadlines, and shutdown
-- Test seams
+## Integration rule
 
-## Address Formatting Rules
+| Consumer | Integration |
+| --- | --- |
+| Accepts `net.Listener` | serve directly on `node.Listen` |
+| Accepts a context dial function | use `node.DialContext` |
+| Opens and polls its own OS file descriptors | bridge through `mod/forward` and a host-local socket |
 
-Yggdrasil addresses are IPv6. Always bracket IPv6 in host-port strings and
-URLs:
+This distinction covers `net/http`, gRPC, fasthttp, websocket libraries,
+`net/rpc`, and fd-oriented loops such as gnet or evio.
+
+## Addresses
+
+Yggdrasil addresses are IPv6. Bracket them in host-port strings and URLs:
 
 ```go
-addr := fmt.Sprintf("[%s]:%d", node.Address(), 8080)
-url := fmt.Sprintf("http://[%s]:%d/api", peerIP, 8080)
+listenAddr := fmt.Sprintf("[%s]:%d", node.Address(), 8080)
+serviceURL := fmt.Sprintf("http://[%s]:%d/api", peerIP, 8080)
 ```
 
-Use bare IPv6 only when an API expects just an IP string, not host-port:
+Use bare IPv6 only when the API expects an IP without a port. Supported network
+strings are `tcp`, `tcp6`, `udp`, and `udp6` where applicable.
+
+## HTTP client
 
 ```go
-fmt.Println(node.Address().String()) // "200:..."
-```
+transport := &http.Transport{
+    DialContext:         node.DialContext,
+    MaxConnsPerHost:     4,
+    MaxIdleConnsPerHost: 2,
+    IdleConnTimeout:     30 * time.Second,
+}
 
-## Outbound HTTP
-
-Use `node.DialContext` as an `http.Transport` dialer:
-
-```go
 client := &http.Client{
-    Transport: &http.Transport{
-        DialContext: node.DialContext,
-    },
-    Timeout: 15 * time.Second,
-}
-
-resp, err := client.Get("http://[200:abcd::1]:8080/api")
-if err != nil {
-    return fmt.Errorf("request over yggdrasil: %w", err)
-}
-defer resp.Body.Close()
-```
-
-Use `DisableKeepAlives: true` for simple peer-to-peer demos where stale
-connections are more confusing than useful:
-
-```go
-client := &http.Client{
-    Transport: &http.Transport{
-        DialContext:       node.DialContext,
-        DisableKeepAlives: true,
-    },
-    Timeout: 10 * time.Second,
+    Transport: transport,
+    Timeout:   15 * time.Second,
 }
 ```
 
-For real use over the mesh, bound the transport — `MaxConnsPerHost`,
-`MaxIdleConnsPerHost`, per-request deadlines — and chunk large transfers. See
-[integrations.md](integrations.md#constrained-mesh-transfer-pattern).
-
-## HTTP Server Inside Yggdrasil
-
-Listen on the node address and a service port:
+These connection values suit a small example, not every deployment. Choose
+them from workload and backend capacity. A request-specific context is
+preferable when different operations need different budgets.
 
 ```go
-addr := fmt.Sprintf("[%s]:%d", node.Address(), 8080)
-ln, err := node.Listen("tcp", addr)
+req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+    "http://[200:abcd::1]:8080/api", nil)
 if err != nil {
-    return fmt.Errorf("listen on yggdrasil: %w", err)
+    return err
+}
+resp, err := client.Do(req)
+```
+
+Close response bodies and reuse the transport. For costly large transfers, see
+[load-safety.md](load-safety.md); small responses do not need a chunk protocol.
+
+## HTTP server
+
+```go
+ln, err := node.Listen("tcp", fmt.Sprintf("[%s]:%d", node.Address(), 8080))
+if err != nil {
+    return err
 }
 
 srv := &http.Server{
@@ -80,26 +73,23 @@ srv := &http.Server{
     IdleTimeout:       60 * time.Second,
 }
 
+serveErr := make(chan error, 1)
 go func() {
-    if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-        log.Printf("yggdrasil http server: %v", err)
-    }
-}()
-
-go func() {
-    <-ctx.Done()
-    shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-    defer cancel()
-    _ = srv.Shutdown(shutdownCtx)
+    serveErr <- srv.Serve(ln)
 }()
 ```
 
-`node.Close()` closes listeners created through the core, but still shut down
-HTTP servers cleanly when the application owns request handling.
+The application owns `http.Server`. On shutdown, stop accepting requests and
+call `srv.Shutdown` before closing the Ratatoskr node. Root close also closes
+tracked listeners, but it cannot coordinate application handlers as well as the
+server's own shutdown method.
 
-## TCP Client And Server
+Apply authentication and handler concurrency limits according to the listener's
+trust boundary.
 
-Outbound TCP:
+## Raw TCP
+
+Outbound:
 
 ```go
 conn, err := node.DialContext(ctx, "tcp", "[200:abcd::1]:9000")
@@ -109,7 +99,7 @@ if err != nil {
 defer conn.Close()
 ```
 
-Inbound TCP:
+Inbound:
 
 ```go
 ln, err := node.Listen("tcp", fmt.Sprintf("[%s]:%d", node.Address(), 9000))
@@ -121,30 +111,20 @@ defer ln.Close()
 for {
     conn, err := ln.Accept()
     if err != nil {
-        if ctx.Err() != nil {
-            return nil
-        }
         return err
     }
-    go handleConn(conn)
+    if !admit() {
+        _ = conn.Close()
+        continue
+    }
+    go handleBounded(conn)
 }
 ```
 
-Use the same `net.Conn` patterns as normal Go networking.
+`admit` and `handleBounded` represent an application-specific admission limit.
+Do not spawn unlimited handlers on an untrusted listener.
 
-## UDP Client And Server
-
-Outbound UDP uses `DialContext` with `udp`:
-
-```go
-conn, err := node.DialContext(ctx, "udp", "[200:abcd::1]:5353")
-if err != nil {
-    return err
-}
-defer conn.Close()
-```
-
-Inbound UDP uses `ListenPacket`:
+## UDP
 
 ```go
 pc, err := node.ListenPacket("udp", fmt.Sprintf("[%s]:%d", node.Address(), 5353))
@@ -153,82 +133,106 @@ if err != nil {
 }
 defer pc.Close()
 
-buf := make([]byte, node.MTU())
+buf := make([]byte, int(node.MTU()))
 n, addr, err := pc.ReadFrom(buf)
 ```
 
-Use `node.MTU()` for packet buffers when the size should match the userspace
-stack.
+Use packet deadlines or a closing context according to the server lifecycle.
+Control offered rate and define how the protocol handles loss, duplication, and
+reordering. More parallel senders can increase overlay loss under saturation.
 
-## LAN Discovery And Admin Socket
+## Frameworks
 
-Multicast lets nodes on the same LAN find each other without configured peers:
+| Framework | Server | Client |
+| --- | --- | --- |
+| `net/http` | `srv.Serve(listener)` | `Transport.DialContext` |
+| fasthttp | `fasthttp.Serve(listener, handler)` | `Client.Dial` wrapper |
+| gRPC | `grpcServer.Serve(listener)` | `grpc.WithContextDialer` |
+| websocket | upgrade on a Ratatoskr-backed HTTP server | library-specific `NetDialContext` |
+| `net/rpc` | serve accepted connections | `rpc.NewClient(conn)` |
+| gnet or evio | host-local forwarding bridge | host-local forwarding bridge |
+
+### gRPC client
+
+Use a passthrough target so gRPC does not resolve a Yggdrasil literal through
+the host DNS stack:
 
 ```go
-if err := node.EnableMulticast(); err != nil {
-    return fmt.Errorf("enable multicast: %w", err)
-}
-defer node.DisableMulticast()
+conn, err := grpc.NewClient(
+    "passthrough:///[200:abcd::1]:9000",
+    grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
+        return node.DialContext(ctx, "tcp", addr)
+    }),
+    grpc.WithTransportCredentials(insecure.NewCredentials()),
+)
 ```
 
-`EnableMulticast()` takes no arguments. Which interfaces it uses comes from
-`cfg.Config.MulticastInterfaces` (each entry has `Regex`, `Beacon`, `Listen`,
-`Port`, `Priority`, `Password`); `yggconfig.GenerateConfig()` fills a working
-default. It logs through the node's own logger, so there is no separate logging
-dependency to wire up.
+Yggdrasil encrypts the path, but application TLS can still provide service
+identity and end-to-end policy at the application protocol layer.
 
-The admin socket is off by default (`AdminListen = "none"`). Most apps never
-need it because Ratatoskr exposes `Snapshot`, `Ask`/`AskAddr`, and peer methods
-directly. Enable it only for compatibility with external `yggdrasilctl`-style
-tooling:
+### fd-based framework bridge
+
+gnet and evio own OS sockets and cannot consume a gVisor listener directly.
+Expose a host-local backend through forwarding:
 
 ```go
-if err := node.EnableAdmin("unix:///run/myapp/ygg.sock"); err != nil {
+fwd, err := forward.New(forward.ConfigObj{
+    Node: node,
+    RemoteTCP: []forward.TCPMappingObj{{
+        Listen: &net.TCPAddr{IP: node.Address(), Port: 9000},
+        Mapped: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9000},
+    }},
+    MaxTCPConnections: 64,
+})
+```
+
+The application owns the forwarder and closes it before the node. Protect the
+host-local backend so other local users cannot bypass application controls.
+
+## Multicast and admin
+
+LAN discovery is behind the root core boundary:
+
+```go
+if err := node.Core().EnableMulticast(); err != nil {
     return err
 }
-defer node.DisableAdmin()
+defer node.Core().DisableMulticast()
 ```
 
-## Contexts, Deadlines, And Shutdown
+Interfaces come from `config.NodeConfig.MulticastInterfaces`. Multicast is
+platform and network-policy dependent; failure should not silently switch the
+application to an unbounded public peer search.
 
-Use per-operation deadlines for remote calls. A running Yggdrasil node can
-outlive a request, but application requests should not block forever:
+The admin endpoint is an unhardened upstream control interface. Prefer
+`Snapshot`, peer methods, NodeInfo, and `mod/probe`. If an operator explicitly
+needs admin access, bind it to a protected platform-appropriate local endpoint.
 
-```go
-ctx, cancel := context.WithTimeout(parent, 10*time.Second)
-defer cancel()
+## Platform adapters
 
-conn, err := node.DialContext(ctx, "tcp", target)
-```
+Loopback TCP is the portable local bridge. Unix sockets, signals, services, and
+filesystem paths require a confirmed target. See
+[platforms.md](platforms.md).
 
-Use `signal.NotifyContext` for command-line services:
+The portable application lifecycle is context cancellation followed by
+dependant-first explicit close. Do not make POSIX signals part of reusable
+networking packages.
 
-```go
-ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-defer stop()
-```
+## Testing seams
 
-Pass that context into `ratatoskr.ConfigObj.Ctx` and into your own servers.
-
-## Test Seams
-
-For outbound-only code:
+Business logic should depend on the narrow contract it consumes:
 
 ```go
 type ContextDialer interface {
     DialContext(context.Context, string, string) (net.Conn, error)
 }
-```
 
-For services:
-
-```go
-type YggNetwork interface {
-    DialContext(context.Context, string, string) (net.Conn, error)
+type Network interface {
+    ContextDialer
     Listen(string, string) (net.Listener, error)
     ListenPacket(string, string) (net.PacketConn, error)
 }
 ```
 
-Use fakes or in-memory pipes for business logic tests. Keep live Ratatoskr
-integration tests behind an explicit build tag or environment variable.
+This shape permits fakes without a live mesh. The skill does not create or run
+tests automatically; the user chooses checks for the target platform.
